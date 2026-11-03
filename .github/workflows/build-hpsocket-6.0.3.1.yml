@@ -135,7 +135,225 @@ jobs:
           $vswhere = (Get-Command vswhere.exe -ErrorAction Stop).Source
           $vsRoot = & $vswhere -latest -products '*' -requires Microsoft.Component.MSBuild -property installationPath
           $dumpbin = Get-ChildItem -LiteralPath (Join-Path $vsRoot 'VC/Tools/MSVC') -Filter dumpbin.exe -Recurse -File |
+                        Where-Object { name: Build HPSocket 6.0.3.1 x64 Unicode Release (No TLS)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: MSVC x64 Unicode Release
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Checkout pinned upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: ldcsaa/HP-Socket
+          ref: 51743f1a05a5c45f6390f116894446c3e6cfcf6b
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Configure MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Verify source version
+        shell: pwsh
+        run: |
+          $headerPath = "source/Windows/Include/HPSocket/HPTypeDef.h"
+          $header = Get-Content -LiteralPath $headerPath -Raw
+          $expected = @(
+            @{ Name = 'MAJOR'; Value = '6' },
+            @{ Name = 'MINOR'; Value = '0' },
+            @{ Name = 'REVISE'; Value = '3' },
+            @{ Name = 'BUILD'; Value = '1' }
+          )
+          foreach ($entry in $expected) {
+            $pattern = "(?m)^#define\s+HP_VERSION_$($entry.Name)\s+$($entry.Value)(?:\s|$)"
+            if ($header -notmatch $pattern) {
+              throw "Unexpected HP-Socket version macro: HP_VERSION_$($entry.Name)"
+            }
+          }
+          Write-Host 'Verified HP-Socket version 6.0.3.1'
+
+      - name: Apply local feature configuration (no TLS)
+        shell: pwsh
+        run: |
+          $headerPath = 'source/Windows/Include/HPSocket/HPTypeDef.h'
+          $header = Get-Content -LiteralPath $headerPath -Raw
+          $flags = @('_SSL_DISABLED', '_HTTP_DISABLED', '_BROTLI_DISABLED')
+          $missing = @()
+          foreach ($flag in $flags) {
+            $pattern = '(?m)^#define\s+' + [regex]::Escape($flag) + '\b'
+            if ($header -notmatch $pattern) { $missing += $flag }
+          }
+          if ($missing.Count -gt 0) {
+            $versionLine = [regex]::Match($header, '(?m)^#define\s+HP_VERSION_BUILD[^\r\n]*')
+            if (-not $versionLine.Success) { throw 'HP_VERSION_BUILD marker not found' }
+            $macroLines = @($missing | ForEach-Object { "#define $_" })
+            $insertText = "`r`n" + ($macroLines -join "`r`n")
+            $header = $header.Insert($versionLine.Index + $versionLine.Length, $insertText)
+          }
+          foreach ($flag in $flags) {
+            $pattern = '(?m)^#define\s+' + [regex]::Escape($flag) + '\b'
+            if ($header -notmatch $pattern) { throw "Failed to define $flag" }
+          }
+          [System.IO.File]::WriteAllText($headerPath, $header, [System.Text.UTF8Encoding]::new($false))
+
+          $projectPath = 'source/Windows/Project/HPSocketLIB-2022/HPSocketLIB.vcxproj'
+          [xml]$project = Get-Content -LiteralPath $projectPath -Raw
+          $group = @($project.Project.ItemDefinitionGroup | Where-Object { $_.Condition -like '*uRelease|x64*' })
+          if ($group.Count -ne 1) { throw "Expected one uRelease|x64 ItemDefinitionGroup; found $($group.Count)" }
+          $before = [string]$group[0].Lib.AdditionalDependencies
+          $remove = @('libssl.lib', 'libcrypto.lib', 'brotli.lib')
+          $after = @($before -split ';' | Where-Object { $_ -and ($remove -notcontains $_.Trim()) })
+          $group[0].Lib.AdditionalDependencies = $after -join ';'
+          $project.Save($projectPath)
+          $remaining = [string]$group[0].Lib.AdditionalDependencies
+          if ($remaining -match 'libssl\.lib|libcrypto\.lib|brotli\.lib') { throw "Disabled feature dependencies remain: $remaining" }
+          Write-Host "Feature flags: _SSL_DISABLED; _HTTP_DISABLED; _BROTLI_DISABLED"
+          Write-Host "Removed optional archive inputs: $($remove -join ', ')"
+      - name: Disable MSVC thread-safe local static initialization and scan source TLS
+        shell: pwsh
+        run: |
+          $projectPath = 'source/Windows/Project/HPSocketLIB-2022/HPSocketLIB.vcxproj'
+          [xml]$project = Get-Content -LiteralPath $projectPath -Raw
+          $group = @($project.Project.ItemDefinitionGroup | Where-Object { $_.Condition -like '*uRelease|x64*' })
+          if ($group.Count -ne 1) { throw "Expected one uRelease|x64 ItemDefinitionGroup; found $($group.Count)" }
+          $compile = $group[0].SelectSingleNode('*[local-name()="ClCompile"]')
+          if ($null -eq $compile) { throw 'ClCompile configuration node not found' }
+          $runtimeNode = $compile.SelectSingleNode('*[local-name()="RuntimeLibrary"]')
+          if ($null -eq $runtimeNode -or $runtimeNode.InnerText -ne 'MultiThreaded') {
+            throw "Expected Release /MT RuntimeLibrary=MultiThreaded; found $($runtimeNode.InnerText)"
+          }
+          $additionalNode = $compile.SelectSingleNode('*[local-name()="AdditionalOptions"]')
+          if ($null -eq $additionalNode) {
+            $additionalNode = $project.CreateElement('AdditionalOptions', $compile.NamespaceURI)
+            [void]$compile.AppendChild($additionalNode)
+          }
+          $additional = [string]$additionalNode.InnerText
+          if ($additional -notmatch '(?i)/Zc:threadSafeInit-') {
+            if ([string]::IsNullOrWhiteSpace($additional)) {
+              $additionalNode.InnerText = '/Zc:threadSafeInit- %(AdditionalOptions)'
+            } else {
+              $additionalNode.InnerText = '/Zc:threadSafeInit- ' + $additional
+            }
+          }
+          if ($additionalNode.InnerText -notmatch '(?i)/Zc:threadSafeInit-') {
+            throw 'Compiler option /Zc:threadSafeInit- was not applied'
+          }
+          $project.Save($projectPath)
+          Write-Host "Verified RuntimeLibrary=MultiThreaded (/MT)"
+          Write-Host "Verified ClCompile AdditionalOptions=$($additionalNode.InnerText)"
+
+          $hits = & git -C source grep -n -I -i -E 'thread_local|__declspec[[:space:]]*\([[:space:]]*thread[[:space:]]*\)' -- Windows/Src Windows/Include
+          $grepExit = $LASTEXITCODE
+          if ($grepExit -eq 0) {
+            $hits | ForEach-Object { Write-Host $_ }
+            throw 'Explicit thread_local or __declspec(thread) declarations found in HP-Socket source'
+          }
+          if ($grepExit -gt 1) { throw "git grep failed with exit code $grepExit" }
+          $global:LASTEXITCODE = 0
+          Write-Host 'Verified: no thread_local or __declspec(thread) declarations in Windows/Src or Windows/Include'
+      - name: Build static library
+        shell: pwsh
+        run: |
+          msbuild "source/Windows/Project/HPSocketLIB-2022/HPSocketLIB.vcxproj" /m /t:Rebuild /p:Configuration=uRelease /p:Platform=x64 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0 /v:minimal
+
+      - name: Verify static library has no MSVC thread-safe TLS helpers
+        shell: pwsh
+        run: |
+          $libPath = 'source/Windows/Lib/HPSocket/x64/static/HPSocket_U.lib'
+          if (-not (Test-Path -LiteralPath $libPath -PathType Leaf)) { throw "Library not found: $libPath" }
+          $vswhere = (Get-Command vswhere.exe -ErrorAction Stop).Source
+          $vsRoot = & $vswhere -latest -products '*' -requires Microsoft.Component.MSBuild -property installationPath
+          $dumpbin = Get-ChildItem -LiteralPath (Join-Path $vsRoot 'VC/Tools/MSVC') -Filter dumpbin.exe -Recurse -File |
             Where-Object { $_.FullName -match '\\Hostx64\\x64\\dumpbin\.exe$' } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin.exe not found' }
+
+          $forbiddenSymbols = @(
+            & $dumpbin.FullName /symbols $libPath 2>&1 |
+              Select-String -Pattern '_Init_thread_header|_Init_thread_footer|_Init_thread_epoch|_tls_index|__tls_used'
+          )
+          $symbolsExit = $LASTEXITCODE
+          if ($symbolsExit -ne 0) { throw "dumpbin /symbols failed with exit code $symbolsExit" }
+          if ($forbiddenSymbols.Count -gt 0) {
+            $forbiddenSymbols | ForEach-Object { Write-Host $_.Line }
+            throw 'MSVC thread-safe static initialization / TLS helper symbols remain in HPSocket_U.lib'
+          }
+
+          $tlsSections = @(
+            & $dumpbin.FullName /headers $libPath 2>&1 |
+              Select-String -Pattern '^\s*[0-9A-F]+\s+\.tls(?:\s|$)'
+          )
+          $headersExit = $LASTEXITCODE
+          if ($headersExit -ne 0) { throw "dumpbin /headers failed with exit code $headersExit" }
+          if ($tlsSections.Count -gt 0) {
+            $tlsSections | ForEach-Object { Write-Host $_.Line }
+            throw 'TLS data section found in HPSocket_U.lib'
+          }
+          $global:LASTEXITCODE = 0
+          Write-Host 'Verified: no _Init_thread_header/_footer/_epoch, _tls_index, __tls_used, or .tls section'
+          Write-Host '.CRT$XCU global initializer entries are allowed; they are C++/ATL initializers, not TLS storage'
+      - name: Package library and matching headers
+        shell: pwsh
+        run: |
+          $libPath = 'source/Windows/Lib/HPSocket/x64/static/HPSocket_U.lib'
+          if (-not (Test-Path -LiteralPath $libPath -PathType Leaf)) {
+            Write-Host 'Build output tree:'
+            Get-ChildItem -LiteralPath 'source/Windows/Lib' -Recurse -ErrorAction SilentlyContinue | Select-Object FullName,Length | Format-Table -AutoSize
+            throw "Expected library not found: $libPath"
+          }
+          New-Item -ItemType Directory -Force -Path 'dist/include/HPSocket' | Out-Null
+          Copy-Item -LiteralPath $libPath -Destination 'dist/HPSocket_U.lib' -Force
+          Copy-Item -LiteralPath 'source/Windows/Include/HPSocket/HPTypeDef.h' -Destination 'dist/include/HPSocket/HPTypeDef.h' -Force
+          Copy-Item -LiteralPath 'source/Windows/Include/HPSocket/HPSocket.h' -Destination 'dist/include/HPSocket/HPSocket.h' -Force
+          Copy-Item -LiteralPath 'source/Windows/Include/HPSocket/SocketInterface.h' -Destination 'dist/include/HPSocket/SocketInterface.h' -Force
+          $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath 'dist/HPSocket_U.lib').Hash.ToLowerInvariant()
+          $size = (Get-Item -LiteralPath 'dist/HPSocket_U.lib').Length
+          $info = @"
+          HP-Socket static library build
+          Version: 6.0.3.1
+          Upstream repository: https://github.com/ldcsaa/HP-Socket
+          Upstream tag: v6.0.3
+          Upstream commit: 51743f1a05a5c45f6390f116894446c3e6cfcf6b
+          Project: Windows/Project/HPSocketLIB-2022/HPSocketLIB.vcxproj
+          Configuration: uRelease
+          Platform: x64
+          Character set: Unicode
+          Runtime library: /MT
+          Thread-safe local static initialization: Disabled (/Zc:threadSafeInit-)
+          Thread-safe helper symbols: Absent (_Init_thread_header, _Init_thread_footer, _Init_thread_epoch)
+          TLS index / TLS section: Absent (_tls_index, __tls_used, .tls)
+          Source TLS declarations: None (thread_local, __declspec(thread))
+          CRT initializer section: .CRT$XCU retained for C++/ATL global initializers; not TLS storage
+          TLS/SSL: Disabled (_SSL_DISABLED)
+          HTTP: Disabled (_HTTP_DISABLED)
+          Brotli: Disabled (_BROTLI_DISABLED)
+          Optional archive inputs removed: libssl.lib, libcrypto.lib, brotli.lib
+          Preprocessor: HPSOCKET_STATIC_LIB; _SSL_DISABLED; _HTTP_DISABLED; _BROTLI_DISABLED
+          Output: HPSocket_U.lib
+          Size bytes: $size
+          SHA256: $sha
+          "@
+          Set-Content -LiteralPath 'dist/build-info.txt' -Value $info -Encoding utf8
+          Compress-Archive -Path 'dist/*' -DestinationPath 'HPSocket-6.0.3.1-x64-UNICODE-MT-NoTLS-NoThreadSafeInit.zip' -Force
+          Get-FileHash -Algorithm SHA256 'HPSocket-6.0.3.1-x64-UNICODE-MT-NoTLS-NoThreadSafeInit.zip' | Format-List
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HPSocket-6.0.3.1-x64-UNICODE-MT-NoTLS-NoThreadSafeInit
+          path: |
+            dist/
+            HPSocket-6.0.3.1-x64-UNICODE-MT-NoTLS-NoThreadSafeInit.zip
+          if-no-files-found: error
+          retention-days: 30.FullName -like '*\Hostx64\x64\dumpbin.exe' } |
             Sort-Object FullName -Descending | Select-Object -First 1
           if (-not $dumpbin) { throw 'dumpbin.exe not found' }
 
