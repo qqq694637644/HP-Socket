@@ -61,7 +61,6 @@ jobs:
           $projectPath = 'source/Windows/Project/HPSocketLIB-2022/HPSocketLIB.vcxproj'
           [xml]$project = Get-Content -LiteralPath $projectPath -Raw
           $group = @($project.Project.ItemDefinitionGroup | Where-Object { $_.Condition -like '*uRelease|x64*' })
-          $group = @($project.Project.ItemDefinitionGroup | Where-Object { $_.Condition -like '*uRelease|x64*' })
           if ($group.Count -ne 1) { throw "Expected one uRelease|x64 ItemDefinitionGroup; found $($group.Count)" }
           $before = [string]$group[0].Lib.AdditionalDependencies
           $remove = @('libssl.lib', 'libcrypto.lib', 'brotli.lib')
