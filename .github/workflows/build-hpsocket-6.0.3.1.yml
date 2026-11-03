@@ -1,4 +1,4 @@
-name: Build HPSocket 6.0.3.1 x64 Unicode Release
+name: Build HPSocket 6.0.3.1 x64 Unicode Release (No TLS)
 
 on:
   workflow_dispatch:
@@ -43,6 +43,33 @@ jobs:
           }
           Write-Host 'Verified HP-Socket version 6.0.3.1'
 
+      - name: Apply local feature configuration (no TLS)
+        shell: pwsh
+        run: |
+          $headerPath = 'source/Windows/Include/HPSocket/HPTypeDef.h'
+          $header = Get-Content -LiteralPath $headerPath -Raw
+          foreach ($flag in @('_SSL_DISABLED', '_HTTP_DISABLED', '_BROTLI_DISABLED')) {
+            if ($header -notmatch "(?m)^#define\s+$flag\b") {
+              $header = [regex]::Replace($header, '(?m)^(#define\s+HP_VERSION_BUILD[^\r\n]*)$', ('$1' + "`r`n#define $flag"), 1)
+            }
+          }
+          foreach ($flag in @('_SSL_DISABLED', '_HTTP_DISABLED', '_BROTLI_DISABLED')) {
+            if ($header -notmatch "(?m)^#define\s+$flag\b") { throw "Failed to define $flag" }
+          }
+          [System.IO.File]::WriteAllText($headerPath, $header, [System.Text.UTF8Encoding]::new($false))
+
+          $projectPath = 'source/Windows/Project/HPSocketLIB-2022/HPSocketLIB.vcxproj'
+          [xml]$project = Get-Content -LiteralPath $projectPath -Raw
+          $condition = "'$(Configuration)|$(Platform)'=='uRelease|x64'"
+          $group = @($project.Project.ItemDefinitionGroup | Where-Object { $_.Condition -eq $condition })
+          if ($group.Count -ne 1) { throw "Expected one uRelease|x64 ItemDefinitionGroup; found $($group.Count)" }
+          $before = [string]$group[0].Lib.AdditionalDependencies
+          $remove = @('libssl.lib', 'libcrypto.lib', 'brotli.lib')
+          $after = @($before -split ';' | Where-Object { $_ -and ($remove -notcontains $_.Trim()) })
+          $group[0].Lib.AdditionalDependencies = $after -join ';'
+          $project.Save($projectPath)
+          Write-Host "Feature flags: _SSL_DISABLED; _HTTP_DISABLED; _BROTLI_DISABLED"
+          Write-Host "Removed optional archive inputs: $($remove -join ', ')"
       - name: Build static library
         shell: pwsh
         run: |
@@ -75,21 +102,25 @@ jobs:
           Platform: x64
           Character set: Unicode
           Runtime library: /MT
-          Preprocessor: HPSOCKET_STATIC_LIB
+          TLS: Disabled (_SSL_DISABLED)
+          HTTP: Disabled (_HTTP_DISABLED)
+          Brotli: Disabled (_BROTLI_DISABLED)
+          Optional archive inputs removed: libssl.lib, libcrypto.lib, brotli.lib
+          Preprocessor: HPSOCKET_STATIC_LIB; _SSL_DISABLED; _HTTP_DISABLED; _BROTLI_DISABLED
           Output: HPSocket_U.lib
           Size bytes: $size
           SHA256: $sha
           "@
           Set-Content -LiteralPath 'dist/build-info.txt' -Value $info -Encoding utf8
-          Compress-Archive -Path 'dist/*' -DestinationPath 'HPSocket-6.0.3.1-x64-UNICODE-Release.zip' -Force
-          Get-FileHash -Algorithm SHA256 'HPSocket-6.0.3.1-x64-UNICODE-Release.zip' | Format-List
+          Compress-Archive -Path 'dist/*' -DestinationPath 'HPSocket-6.0.3.1-x64-UNICODE-Release-NoTLS.zip' -Force
+          Get-FileHash -Algorithm SHA256 'HPSocket-6.0.3.1-x64-UNICODE-Release-NoTLS.zip' | Format-List
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HPSocket-6.0.3.1-x64-UNICODE-Release
+          name: HPSocket-6.0.3.1-x64-UNICODE-Release-NoTLS
           path: |
             dist/
-            HPSocket-6.0.3.1-x64-UNICODE-Release.zip
+            HPSocket-6.0.3.1-x64-UNICODE-Release-NoTLS.zip
           if-no-files-found: error
           retention-days: 30
