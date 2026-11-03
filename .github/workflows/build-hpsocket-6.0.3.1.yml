@@ -127,6 +127,42 @@ jobs:
         run: |
           msbuild "source/Windows/Project/HPSocketLIB-2022/HPSocketLIB.vcxproj" /m /t:Rebuild /p:Configuration=uRelease /p:Platform=x64 /p:PlatformToolset=v143 /p:WindowsTargetPlatformVersion=10.0 /v:minimal
 
+      - name: Verify static library has no MSVC thread-safe TLS helpers
+        shell: pwsh
+        run: |
+          $libPath = 'source/Windows/Lib/HPSocket/x64/static/HPSocket_U.lib'
+          if (-not (Test-Path -LiteralPath $libPath -PathType Leaf)) { throw "Library not found: $libPath" }
+          $vswhere = (Get-Command vswhere.exe -ErrorAction Stop).Source
+          $vsRoot = & $vswhere -latest -products '*' -requires Microsoft.Component.MSBuild -property installationPath
+          $dumpbin = Get-ChildItem -LiteralPath (Join-Path $vsRoot 'VC/Tools/MSVC') -Filter dumpbin.exe -Recurse -File |
+            Where-Object { $_.FullName -match '\\Hostx64\\x64\\dumpbin\.exe$' } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin.exe not found' }
+
+          $forbiddenSymbols = @(
+            & $dumpbin.FullName /symbols $libPath 2>&1 |
+              Select-String -Pattern '_Init_thread_header|_Init_thread_footer|_Init_thread_epoch|_tls_index|__tls_used'
+          )
+          $symbolsExit = $LASTEXITCODE
+          if ($symbolsExit -ne 0) { throw "dumpbin /symbols failed with exit code $symbolsExit" }
+          if ($forbiddenSymbols.Count -gt 0) {
+            $forbiddenSymbols | ForEach-Object { Write-Host $_.Line }
+            throw 'MSVC thread-safe static initialization / TLS helper symbols remain in HPSocket_U.lib'
+          }
+
+          $tlsSections = @(
+            & $dumpbin.FullName /headers $libPath 2>&1 |
+              Select-String -Pattern '^\s*[0-9A-F]+\s+\.tls(?:\s|$)'
+          )
+          $headersExit = $LASTEXITCODE
+          if ($headersExit -ne 0) { throw "dumpbin /headers failed with exit code $headersExit" }
+          if ($tlsSections.Count -gt 0) {
+            $tlsSections | ForEach-Object { Write-Host $_.Line }
+            throw 'TLS data section found in HPSocket_U.lib'
+          }
+          $global:LASTEXITCODE = 0
+          Write-Host 'Verified: no _Init_thread_header/_footer/_epoch, _tls_index, __tls_used, or .tls section'
+          Write-Host '.CRT$XCU global initializer entries are allowed; they are C++/ATL initializers, not TLS storage'
       - name: Package library and matching headers
         shell: pwsh
         run: |
@@ -155,6 +191,10 @@ jobs:
           Character set: Unicode
           Runtime library: /MT
           Thread-safe local static initialization: Disabled (/Zc:threadSafeInit-)
+          Thread-safe helper symbols: Absent (_Init_thread_header, _Init_thread_footer, _Init_thread_epoch)
+          TLS index / TLS section: Absent (_tls_index, __tls_used, .tls)
+          Source TLS declarations: None (thread_local, __declspec(thread))
+          CRT initializer section: .CRT$XCU retained for C++/ATL global initializers; not TLS storage
           TLS/SSL: Disabled (_SSL_DISABLED)
           HTTP: Disabled (_HTTP_DISABLED)
           Brotli: Disabled (_BROTLI_DISABLED)
