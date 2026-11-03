@@ -120,6 +120,7 @@ jobs:
             throw 'Explicit thread_local or __declspec(thread) declarations found in HP-Socket source'
           }
           if ($grepExit -gt 1) { throw "git grep failed with exit code $grepExit" }
+          $global:LASTEXITCODE = 0
           Write-Host 'Verified: no thread_local or __declspec(thread) declarations in Windows/Src or Windows/Include'
       - name: Build static library
         shell: pwsh
