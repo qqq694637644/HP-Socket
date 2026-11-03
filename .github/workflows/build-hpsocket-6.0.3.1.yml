@@ -48,13 +48,22 @@ jobs:
         run: |
           $headerPath = 'source/Windows/Include/HPSocket/HPTypeDef.h'
           $header = Get-Content -LiteralPath $headerPath -Raw
-          foreach ($flag in @('_SSL_DISABLED', '_HTTP_DISABLED', '_BROTLI_DISABLED')) {
-            if ($header -notmatch "(?m)^#define\s+$flag\b") {
-              $header = [regex]::Replace($header, '(?m)^(#define\s+HP_VERSION_BUILD[^\r\n]*)$', ('$1' + "`r`n#define $flag"), 1)
-            }
+          $flags = @('_SSL_DISABLED', '_HTTP_DISABLED', '_BROTLI_DISABLED')
+          $missing = @()
+          foreach ($flag in $flags) {
+            $pattern = '(?m)^#define\s+' + [regex]::Escape($flag) + '\b'
+            if ($header -notmatch $pattern) { $missing += $flag }
           }
-          foreach ($flag in @('_SSL_DISABLED', '_HTTP_DISABLED', '_BROTLI_DISABLED')) {
-            if ($header -notmatch "(?m)^#define\s+$flag\b") { throw "Failed to define $flag" }
+          if ($missing.Count -gt 0) {
+            $versionLine = [regex]::Match($header, '(?m)^#define\s+HP_VERSION_BUILD[^\r\n]*')
+            if (-not $versionLine.Success) { throw 'HP_VERSION_BUILD marker not found' }
+            $macroLines = @($missing | ForEach-Object { "#define $_" })
+            $insertText = "`r`n" + ($macroLines -join "`r`n")
+            $header = $header.Insert($versionLine.Index + $versionLine.Length, $insertText)
+          }
+          foreach ($flag in $flags) {
+            $pattern = '(?m)^#define\s+' + [regex]::Escape($flag) + '\b'
+            if ($header -notmatch $pattern) { throw "Failed to define $flag" }
           }
           [System.IO.File]::WriteAllText($headerPath, $header, [System.Text.UTF8Encoding]::new($false))
 
@@ -67,6 +76,8 @@ jobs:
           $after = @($before -split ';' | Where-Object { $_ -and ($remove -notcontains $_.Trim()) })
           $group[0].Lib.AdditionalDependencies = $after -join ';'
           $project.Save($projectPath)
+          $remaining = [string]$group[0].Lib.AdditionalDependencies
+          if ($remaining -match 'libssl\.lib|libcrypto\.lib|brotli\.lib') { throw "Disabled feature dependencies remain: $remaining" }
           Write-Host "Feature flags: _SSL_DISABLED; _HTTP_DISABLED; _BROTLI_DISABLED"
           Write-Host "Removed optional archive inputs: $($remove -join ', ')"
       - name: Build static library
