@@ -272,7 +272,7 @@ jobs:
           $vswhere = (Get-Command vswhere.exe -ErrorAction Stop).Source
           $vsRoot = & $vswhere -latest -products '*' -requires Microsoft.Component.MSBuild -property installationPath
           $dumpbin = Get-ChildItem -LiteralPath (Join-Path $vsRoot 'VC/Tools/MSVC') -Filter dumpbin.exe -Recurse -File |
-            Where-Object { $_.FullName -match '\\Hostx64\\x64\\dumpbin\.exe$' } |
+            Where-Object { $_.FullName -like '*\Hostx64\x64\dumpbin.exe' } |
             Sort-Object FullName -Descending | Select-Object -First 1
           if (-not $dumpbin) { throw 'dumpbin.exe not found' }
 
