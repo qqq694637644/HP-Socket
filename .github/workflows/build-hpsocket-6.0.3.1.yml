@@ -80,6 +80,47 @@ jobs:
           if ($remaining -match 'libssl\.lib|libcrypto\.lib|brotli\.lib') { throw "Disabled feature dependencies remain: $remaining" }
           Write-Host "Feature flags: _SSL_DISABLED; _HTTP_DISABLED; _BROTLI_DISABLED"
           Write-Host "Removed optional archive inputs: $($remove -join ', ')"
+      - name: Disable MSVC thread-safe local static initialization and scan source TLS
+        shell: pwsh
+        run: |
+          $projectPath = 'source/Windows/Project/HPSocketLIB-2022/HPSocketLIB.vcxproj'
+          [xml]$project = Get-Content -LiteralPath $projectPath -Raw
+          $group = @($project.Project.ItemDefinitionGroup | Where-Object { $_.Condition -like '*uRelease|x64*' })
+          if ($group.Count -ne 1) { throw "Expected one uRelease|x64 ItemDefinitionGroup; found $($group.Count)" }
+          $compile = $group[0].SelectSingleNode('*[local-name()="ClCompile"]')
+          if ($null -eq $compile) { throw 'ClCompile configuration node not found' }
+          $runtimeNode = $compile.SelectSingleNode('*[local-name()="RuntimeLibrary"]')
+          if ($null -eq $runtimeNode -or $runtimeNode.InnerText -ne 'MultiThreaded') {
+            throw "Expected Release /MT RuntimeLibrary=MultiThreaded; found $($runtimeNode.InnerText)"
+          }
+          $additionalNode = $compile.SelectSingleNode('*[local-name()="AdditionalOptions"]')
+          if ($null -eq $additionalNode) {
+            $additionalNode = $project.CreateElement('AdditionalOptions', $compile.NamespaceURI)
+            [void]$compile.AppendChild($additionalNode)
+          }
+          $additional = [string]$additionalNode.InnerText
+          if ($additional -notmatch '(?i)/Zc:threadSafeInit-') {
+            if ([string]::IsNullOrWhiteSpace($additional)) {
+              $additionalNode.InnerText = '/Zc:threadSafeInit- %(AdditionalOptions)'
+            } else {
+              $additionalNode.InnerText = '/Zc:threadSafeInit- ' + $additional
+            }
+          }
+          if ($additionalNode.InnerText -notmatch '(?i)/Zc:threadSafeInit-') {
+            throw 'Compiler option /Zc:threadSafeInit- was not applied'
+          }
+          $project.Save($projectPath)
+          Write-Host "Verified RuntimeLibrary=MultiThreaded (/MT)"
+          Write-Host "Verified ClCompile AdditionalOptions=$($additionalNode.InnerText)"
+
+          $hits = & git -C source grep -n -I -i -E 'thread_local|__declspec[[:space:]]*\([[:space:]]*thread[[:space:]]*\)' -- Windows/Src Windows/Include
+          $grepExit = $LASTEXITCODE
+          if ($grepExit -eq 0) {
+            $hits | ForEach-Object { Write-Host $_ }
+            throw 'Explicit thread_local or __declspec(thread) declarations found in HP-Socket source'
+          }
+          if ($grepExit -gt 1) { throw "git grep failed with exit code $grepExit" }
+          Write-Host 'Verified: no thread_local or __declspec(thread) declarations in Windows/Src or Windows/Include'
       - name: Build static library
         shell: pwsh
         run: |
@@ -112,7 +153,8 @@ jobs:
           Platform: x64
           Character set: Unicode
           Runtime library: /MT
-          TLS: Disabled (_SSL_DISABLED)
+          Thread-safe local static initialization: Disabled (/Zc:threadSafeInit-)
+          TLS/SSL: Disabled (_SSL_DISABLED)
           HTTP: Disabled (_HTTP_DISABLED)
           Brotli: Disabled (_BROTLI_DISABLED)
           Optional archive inputs removed: libssl.lib, libcrypto.lib, brotli.lib
@@ -122,15 +164,15 @@ jobs:
           SHA256: $sha
           "@
           Set-Content -LiteralPath 'dist/build-info.txt' -Value $info -Encoding utf8
-          Compress-Archive -Path 'dist/*' -DestinationPath 'HPSocket-6.0.3.1-x64-UNICODE-Release-NoTLS.zip' -Force
-          Get-FileHash -Algorithm SHA256 'HPSocket-6.0.3.1-x64-UNICODE-Release-NoTLS.zip' | Format-List
+          Compress-Archive -Path 'dist/*' -DestinationPath 'HPSocket-6.0.3.1-x64-UNICODE-MT-NoTLS-NoThreadSafeInit.zip' -Force
+          Get-FileHash -Algorithm SHA256 'HPSocket-6.0.3.1-x64-UNICODE-MT-NoTLS-NoThreadSafeInit.zip' | Format-List
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HPSocket-6.0.3.1-x64-UNICODE-Release-NoTLS
+          name: HPSocket-6.0.3.1-x64-UNICODE-MT-NoTLS-NoThreadSafeInit
           path: |
             dist/
-            HPSocket-6.0.3.1-x64-UNICODE-Release-NoTLS.zip
+            HPSocket-6.0.3.1-x64-UNICODE-MT-NoTLS-NoThreadSafeInit.zip
           if-no-files-found: error
           retention-days: 30
